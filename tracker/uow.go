@@ -1,15 +1,31 @@
-package db
+package tracker
 
 import (
 	"context"
+	"database/sql"
 	"sync"
 
+	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
+// Tx is a minimal transaction interface that hides GORM from callers.
+// It offers basic data operations used by this project.
+type Tx interface {
+	Create(value any) error
+	Save(value any) error
+	Delete(value any, conds ...any) error
+}
+
+type gormTx struct{ db *gorm.DB }
+
+func (t gormTx) Create(value any) error               { return t.db.Create(value).Error }
+func (t gormTx) Save(value any) error                 { return t.db.Save(value).Error }
+func (t gormTx) Delete(value any, conds ...any) error { return t.db.Delete(value, conds...).Error }
+
 // Operation represents a deferred operation to be executed inside the transaction.
-// It receives the transactional gorm.DB and should return an error to rollback the transaction.
-type Operation func(tx *gorm.DB) error
+// It receives an abstract Tx to avoid leaking GORM to the outside world.
+type Operation func(tx Tx) error
 
 // UnitOfWork implements a simple Unit of Work pattern on top of GORM.
 // It collects changes and applies them in a single transaction on SaveChanges/SaveChanges.
@@ -31,14 +47,16 @@ type UnitOfWork struct {
 	afterRollback []func()
 }
 
-// New creates a new UnitOfWork using the provided gorm.DB as the root connection.
-// The root DB must be configured and open. It will not start a transaction until SaveChanges/SaveChanges.
-func New(db *gorm.DB) *UnitOfWork {
-	return &UnitOfWork{root: db}
+// New creates a new UnitOfWork using the provided standard sql.DB as the root connection.
+// Internally it uses GORM with the SQLite driver, but callers don't need to know that.
+func New(sqlDB *sql.DB) *UnitOfWork {
+	gormDB, _ := gorm.Open(sqlite.Dialector{Conn: sqlDB}, &gorm.Config{})
+
+	return &UnitOfWork{root: gormDB}
 }
 
-// Root returns the underlying root *gorm.DB.
-func (u *UnitOfWork) Root() *gorm.DB { return u.root }
+// AutoMigrate runs auto-migrations for the given models without exposing GORM.
+func (u *UnitOfWork) AutoMigrate(models ...any) error { return u.root.AutoMigrate(models...) }
 
 // Do queue a custom operation to be executed inside the transaction at commit time.
 func (u *UnitOfWork) Do(op Operation) {
@@ -121,7 +139,7 @@ func (u *UnitOfWork) Commit(ctx context.Context) error {
 		}
 		// 4. Apply custom operations
 		for _, op := range deferredOps {
-			if err := op(tx); err != nil {
+			if err := op(gormTx{db: tx}); err != nil {
 				return err
 			}
 		}
@@ -130,7 +148,7 @@ func (u *UnitOfWork) Commit(ctx context.Context) error {
 
 	if txErr != nil {
 		for _, cb := range afterRollback {
-			// best-effort and safe, do not shadow txErr if callback fails
+			// best-effort and safe do not shadow txErr if callback fails
 			func() { defer func() { _ = recover() }(); cb() }()
 		}
 		return txErr
@@ -161,4 +179,18 @@ func (u *UnitOfWork) HasPending() bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return len(u.ops) > 0 || len(u.toCreate) > 0 || len(u.toUpdate) > 0 || len(u.toDelete) > 0
+}
+
+// First fetches the first record that matches the conditions into out, without exposing GORM.
+func (u *UnitOfWork) First(ctx context.Context, out any, conds ...any) error {
+	return u.root.WithContext(ctx).First(out, conds...).Error
+}
+
+// PreloadFirst preloads associations and fetches the first record by primary key.
+func (u *UnitOfWork) PreloadFirst(ctx context.Context, out any, id any, preloads ...string) error {
+	db := u.root.WithContext(ctx)
+	for _, p := range preloads {
+		db = db.Preload(p)
+	}
+	return db.First(out, id).Error
 }

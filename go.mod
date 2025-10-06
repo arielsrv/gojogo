@@ -3,7 +3,7 @@ module gojogo
 go 1.25.1
 
 require (
-	github.com/mattn/go-sqlite3 v1.14.22
+	github.com/mattn/go-sqlite3 v1.14.32
 	gorm.io/driver/sqlite v1.6.0
 	gorm.io/gorm v1.31.0
 )

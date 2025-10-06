@@ -19,9 +19,9 @@ type Tx interface {
 
 type gormTx struct{ db *gorm.DB }
 
-func (t gormTx) Create(value any) error               { return t.db.Create(value).Error }
-func (t gormTx) Save(value any) error                 { return t.db.Save(value).Error }
-func (t gormTx) Delete(value any, conds ...any) error { return t.db.Delete(value, conds...).Error }
+func (r gormTx) Create(value any) error               { return r.db.Create(value).Error }
+func (r gormTx) Save(value any) error                 { return r.db.Save(value).Error }
+func (r gormTx) Delete(value any, conds ...any) error { return r.db.Delete(value, conds...).Error }
 
 // Operation represents a deferred operation to be executed inside the transaction.
 // It receives an abstract Tx to avoid leaking GORM to the outside world.
@@ -35,7 +35,6 @@ type Operation func(tx Tx) error
 type UnitOfWork struct {
 	root *gorm.DB
 
-	mu       sync.Mutex
 	ops      []Operation
 	toCreate []any
 	toUpdate []any
@@ -45,80 +44,94 @@ type UnitOfWork struct {
 	afterCommit []func()
 	// afterRollback contains callbacks to run after a rollback (outside tx)
 	afterRollback []func()
+
+	mu sync.Mutex
 }
 
-// New creates a new UnitOfWork using the provided standard sql.DB as the root connection.
-// Internally it uses GORM with the SQLite driver, but callers don't need to know that.
-func New(sqlDB *sql.DB) *UnitOfWork {
-	gormDB, _ := gorm.Open(sqlite.Dialector{Conn: sqlDB}, &gorm.Config{})
+// gormRoots caches a single *gorm.DB per *sql.DB so we don't call gorm.Open on every tracker.New.
+// This keeps the public API simple while avoiding repeated initialization cost.
+// Note: entries are not pruned automatically; ensure you reuse *sql.DB for app lifetime.
+var gormRoots sync.Map
 
-	return &UnitOfWork{root: gormDB}
+// New creates a new UnitOfWork using the provided standard sql.DB as the root connection.
+// Internally, it uses GORM with the SQLite driver, but callers don't need to know that.
+func New(sqlDB *sql.DB) *UnitOfWork {
+	if v, ok := gormRoots.Load(sqlDB); ok {
+		return &UnitOfWork{root: v.(*gorm.DB)}
+	}
+	gdb, err := gorm.Open(sqlite.Dialector{Conn: sqlDB}, &gorm.Config{})
+	if err == nil && gdb != nil {
+		actual, _ := gormRoots.LoadOrStore(sqlDB, gdb)
+		return &UnitOfWork{root: actual.(*gorm.DB)}
+	}
+	// Fallback preserves previous behavior of ignoring open errors, but root may be nil.
+	return &UnitOfWork{root: gdb}
 }
 
 // AutoMigrate runs auto-migrations for the given models without exposing GORM.
-func (u *UnitOfWork) AutoMigrate(models ...any) error { return u.root.AutoMigrate(models...) }
+func (r *UnitOfWork) AutoMigrate(models ...any) error { return r.root.AutoMigrate(models...) }
 
 // Do queue a custom operation to be executed inside the transaction at commit time.
-func (u *UnitOfWork) Do(op Operation) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	u.ops = append(u.ops, op)
+func (r *UnitOfWork) Do(op Operation) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ops = append(r.ops, op)
 }
 
 // Add tracks an entity to be created on commit.
-func (u *UnitOfWork) Add(entity any) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	u.toCreate = append(u.toCreate, entity)
+func (r *UnitOfWork) Add(entity any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.toCreate = append(r.toCreate, entity)
 }
 
 // Update tracks an entity to be updated on commit.
-func (u *UnitOfWork) Update(entity any) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	u.toUpdate = append(u.toUpdate, entity)
+func (r *UnitOfWork) Update(entity any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.toUpdate = append(r.toUpdate, entity)
 }
 
 // RegisterDelete tracks an entity to be deleted on commit.
-func (u *UnitOfWork) RegisterDelete(entity any) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	u.toDelete = append(u.toDelete, entity)
+func (r *UnitOfWork) RegisterDelete(entity any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.toDelete = append(r.toDelete, entity)
 }
 
 // AfterCommit registers a callback to be executed after a successful commit (outside transaction).
-func (u *UnitOfWork) AfterCommit(cb func()) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	u.afterCommit = append(u.afterCommit, cb)
+func (r *UnitOfWork) AfterCommit(cb func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.afterCommit = append(r.afterCommit, cb)
 }
 
 // AfterRollback registers a callback to be executed after a rollback (outside transaction).
-func (u *UnitOfWork) AfterRollback(cb func()) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	u.afterRollback = append(u.afterRollback, cb)
+func (r *UnitOfWork) AfterRollback(cb func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.afterRollback = append(r.afterRollback, cb)
 }
 
 // SaveChanges commits all tracked changes in a single transaction.
 // It is an alias for SaveChanges to resemble EF's SaveChanges terminology.
-func (u *UnitOfWork) SaveChanges(ctx context.Context) error { return u.Commit(ctx) }
+func (r *UnitOfWork) SaveChanges(ctx context.Context) error { return r.Commit(ctx) }
 
 // Commit begins a transaction and applies all pending operations.
 // On error, the transaction is rolled back and the pending operations remain queued
 // so the caller can inspect or retry if desired. Use Clear() to discard them.
-func (u *UnitOfWork) Commit(ctx context.Context) error {
-	u.mu.Lock()
-	deferredOps := make([]Operation, len(u.ops))
-	copy(deferredOps, u.ops)
-	creates := append([]any(nil), u.toCreate...)
-	updates := append([]any(nil), u.toUpdate...)
-	deletes := append([]any(nil), u.toDelete...)
-	afterCommit := append([]func(){}, u.afterCommit...)
-	afterRollback := append([]func(){}, u.afterRollback...)
-	u.mu.Unlock()
+func (r *UnitOfWork) Commit(ctx context.Context) error {
+	r.mu.Lock()
+	deferredOps := make([]Operation, len(r.ops))
+	copy(deferredOps, r.ops)
+	creates := append([]any(nil), r.toCreate...)
+	updates := append([]any(nil), r.toUpdate...)
+	deletes := append([]any(nil), r.toDelete...)
+	afterCommit := append([]func(){}, r.afterCommit...)
+	afterRollback := append([]func(){}, r.afterRollback...)
+	r.mu.Unlock()
 
-	txErr := u.root.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	txErr := r.root.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// 1. Apply creates
 		for _, e := range creates {
 			if err := tx.Create(e).Error; err != nil {
@@ -155,7 +168,7 @@ func (u *UnitOfWork) Commit(ctx context.Context) error {
 	}
 
 	// On success, clear pending items and run after-commit callbacks
-	u.Clear()
+	r.Clear()
 	for _, cb := range afterCommit {
 		func() { defer func() { _ = recover() }(); cb() }()
 	}
@@ -163,32 +176,32 @@ func (u *UnitOfWork) Commit(ctx context.Context) error {
 }
 
 // Clear discards all pending operations and tracked entities.
-func (u *UnitOfWork) Clear() {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	u.ops = nil
-	u.toCreate = nil
-	u.toUpdate = nil
-	u.toDelete = nil
-	u.afterCommit = nil
-	u.afterRollback = nil
+func (r *UnitOfWork) Clear() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ops = nil
+	r.toCreate = nil
+	r.toUpdate = nil
+	r.toDelete = nil
+	r.afterCommit = nil
+	r.afterRollback = nil
 }
 
 // HasPending returns true if there are any queued operations or tracked changes.
-func (u *UnitOfWork) HasPending() bool {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return len(u.ops) > 0 || len(u.toCreate) > 0 || len(u.toUpdate) > 0 || len(u.toDelete) > 0
+func (r *UnitOfWork) HasPending() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.ops) > 0 || len(r.toCreate) > 0 || len(r.toUpdate) > 0 || len(r.toDelete) > 0
 }
 
 // First fetches the first record that matches the conditions into out, without exposing GORM.
-func (u *UnitOfWork) First(ctx context.Context, out any, conds ...any) error {
-	return u.root.WithContext(ctx).First(out, conds...).Error
+func (r *UnitOfWork) First(ctx context.Context, out any, conds ...any) error {
+	return r.root.WithContext(ctx).First(out, conds...).Error
 }
 
 // PreloadFirst preloads associations and fetches the first record by primary key.
-func (u *UnitOfWork) PreloadFirst(ctx context.Context, out any, id any, preloads ...string) error {
-	db := u.root.WithContext(ctx)
+func (r *UnitOfWork) PreloadFirst(ctx context.Context, out any, id any, preloads ...string) error {
+	db := r.root.WithContext(ctx)
 	for _, p := range preloads {
 		db = db.Preload(p)
 	}

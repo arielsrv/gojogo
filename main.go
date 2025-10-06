@@ -1,10 +1,10 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"gojogo/tracker"
 	"log"
 	"net/http"
 	"strconv"
@@ -12,28 +12,8 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"gojogo/tracker"
 )
-
-// Customer represents a customer with one-to-many Orders
-// json tags for HTTP responses
-type Customer struct {
-	ID        uint      `gorm:"primaryKey" json:"id"`
-	Name      string    `gorm:"size:200;not null" json:"name"`
-	Email     string    `gorm:"size:255;uniqueIndex" json:"email"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-
-	Orders []Order `json:"orders,omitempty"`
-}
-
-// Order represents a simple order linked to a Customer
-type Order struct {
-	ID         uint      `gorm:"primaryKey" json:"id"`
-	CustomerID uint      `gorm:"index;not null" json:"customer_id"`
-	Amount     float64   `gorm:"not null" json:"amount"`
-	Status     string    `gorm:"size:50;not null" json:"status"`
-	CreatedAt  time.Time `json:"created_at"`
-}
 
 type createCustomerRequest struct {
 	Name  string  `json:"name"`
@@ -48,13 +28,20 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to open database: %v", err)
 	}
-	defer sqlDB.Close()
-	if err = sqlDB.Ping(); err != nil {
+	defer func(sqlDB *sql.DB) {
+		err = sqlDB.Close()
+		if err != nil {
+			log.Fatalf("failed to close database: %v", err)
+		}
+	}(sqlDB)
+
+	ctx := context.Background()
+	if err = sqlDB.PingContext(ctx); err != nil {
 		log.Fatalf("failed to ping database: %v", err)
 	}
 
 	// Run migrations once at startup using a temporary UoW
-	if err := tracker.New(sqlDB).AutoMigrate(&Customer{}, &Order{}); err != nil {
+	if err = tracker.New(sqlDB).AutoMigrate(&Customer{}, &Order{}); err != nil {
 		log.Fatalf("failed to migrate database: %v", err)
 	}
 
@@ -87,7 +74,7 @@ func main() {
 	})
 
 	log.Println("HTTP server listening on :8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	if err = http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -156,7 +143,7 @@ func getCustomerHandler(sqlDB *sql.DB, w http.ResponseWriter, r *http.Request) {
 	}
 	uow := tracker.New(sqlDB)
 	var out Customer
-	if err := uow.PreloadFirst(r.Context(), &out, id, "Orders"); err != nil {
+	if err = uow.PreloadFirst(r.Context(), &out, id, "Orders"); err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
@@ -172,10 +159,13 @@ func concurrentHandler(sqlDB *sql.DB, w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	done := make(chan error, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		go func(i int) {
 			u := tracker.New(sqlDB)
-			c := &Customer{Name: fmt.Sprintf("User %d", i), Email: fmt.Sprintf("user%d+%d@example.com", i, time.Now().UnixNano())}
+			c := &Customer{
+				Name:  fmt.Sprintf("User %d", i),
+				Email: fmt.Sprintf("user%d+%d@example.com", i, time.Now().UnixNano()),
+			}
 			u.Add(c)
 			u.Do(func(tx tracker.Tx) error {
 				return tx.Create(&Order{CustomerID: c.ID, Amount: float64(10 + i), Status: "NEW"})
@@ -184,7 +174,7 @@ func concurrentHandler(sqlDB *sql.DB, w http.ResponseWriter, r *http.Request) {
 		}(i)
 	}
 	var ok, fail int
-	for i := 0; i < n; i++ {
+	for range n {
 		if err := <-done; err != nil {
 			fail++
 		} else {
